@@ -2,131 +2,111 @@ import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
-import io
-
-# Try to import mediapipe with error handling
-try:
-    import mediapipe as mp
-    from mediapipe.python.solutions import face_mesh as mp_face_mesh
-    from mediapipe.python.solutions import drawing_utils as mp_drawing
-    from mediapipe.python.solutions import drawing_styles as mp_drawing_styles
-except ImportError:
-    try:
-        import mediapipe as mp
-        mp_face_mesh = mp.solutions.face_mesh
-        mp_drawing = mp.solutions.drawing_utils
-        mp_drawing_styles = mp.solutions.drawing_styles
-    except AttributeError as e:
-        st.error(f"Error importing mediapipe: {e}")
-        st.error("Please reinstall mediapipe: pip uninstall mediapipe && pip install mediapipe")
-        st.stop()
 
 # Page config
 st.set_page_config(page_title="Face Recognition System", layout="wide")
 
-st.title("🎯 Face Recognition & Landmark Detection")
-st.write("Upload an image or use your webcam to detect facial features")
+st.title("🎯 Face Recognition & Feature Detection")
+st.write("Upload an image or use your webcam to detect faces and facial features")
 
 # Sidebar options
 st.sidebar.header("Settings")
-detection_confidence = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.5, 0.1)
-tracking_confidence = st.sidebar.slider("Tracking Confidence", 0.1, 1.0, 0.5, 0.1)
-show_landmarks = st.sidebar.checkbox("Show All Landmarks", value=True)
-show_contours = st.sidebar.checkbox("Show Face Contours", value=True)
+scale_factor = st.sidebar.slider("Detection Scale Factor", 1.01, 1.5, 1.1, 0.01)
+min_neighbors = st.sidebar.slider("Min Neighbors", 1, 10, 5, 1)
+show_landmarks = st.sidebar.checkbox("Show Eye Detection", value=True)
 
-def detect_face_landmarks(image):
-    """Detect facial landmarks using MediaPipe"""
+# Load pre-trained models
+@st.cache_resource
+def load_models():
+    """Load OpenCV pre-trained cascade classifiers"""
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+    mouth_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_smile.xml')
+    return face_cascade, eye_cascade, mouth_cascade
+
+face_cascade, eye_cascade, mouth_cascade = load_models()
+
+def detect_face_features(image):
+    """Detect facial features using OpenCV"""
     # Convert PIL to cv2
     img_array = np.array(image)
     img_rgb = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2GRAY)
     
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=5,
-        refine_landmarks=True,
-        min_detection_confidence=detection_confidence,
-        min_tracking_confidence=tracking_confidence
-    ) as face_mesh:
+    # Detect faces
+    faces = face_cascade.detectMultiScale(
+        gray, 
+        scaleFactor=scale_factor, 
+        minNeighbors=min_neighbors,
+        minSize=(30, 30)
+    )
+    
+    if len(faces) == 0:
+        return None, "No face detected"
+    
+    annotated_image = img_rgb.copy()
+    feature_count = {'faces': len(faces), 'eyes': 0, 'mouths': 0}
+    
+    for (x, y, w, h) in faces:
+        # Draw face rectangle
+        cv2.rectangle(annotated_image, (x, y), (x+w, y+h), (0, 255, 0), 3)
+        cv2.putText(annotated_image, 'Face', (x, y-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
         
-        results = face_mesh.process(cv2.cvtColor(img_rgb, cv2.COLOR_BGR2RGB))
+        # Region of interest for eyes and mouth (inside face)
+        roi_gray = gray[y:y+h, x:x+w]
+        roi_color = annotated_image[y:y+h, x:x+w]
         
-        if not results.multi_face_landmarks:
-            return None, "No face detected"
+        if show_landmarks:
+            # Detect eyes
+            eyes = eye_cascade.detectMultiScale(roi_gray, 1.1, 10, minSize=(20, 20))
+            for (ex, ey, ew, eh) in eyes:
+                cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), (255, 0, 0), 2)
+                cv2.circle(roi_color, (ex + ew//2, ey + eh//2), 3, (255, 0, 0), -1)
+                cv2.putText(roi_color, 'Eye', (ex, ey-5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                feature_count['eyes'] += 1
+            
+            # Detect mouth/smile (lower half of face)
+            mouth_roi_gray = roi_gray[h//2:, :]
+            mouth_roi_color = roi_color[h//2:, :]
+            mouths = mouth_cascade.detectMultiScale(mouth_roi_gray, 1.5, 15, minSize=(30, 20))
+            for (mx, my, mw, mh) in mouths:
+                cv2.rectangle(mouth_roi_color, (mx, my), (mx+mw, my+mh), (0, 0, 255), 2)
+                cv2.putText(mouth_roi_color, 'Mouth', (mx, my-5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                feature_count['mouths'] += 1
         
-        annotated_image = img_rgb.copy()
+        # Draw approximate nose location (center of face, middle third)
+        nose_x = x + w//2
+        nose_y = y + h//2
+        cv2.circle(annotated_image, (nose_x, nose_y), 5, (255, 255, 0), -1)
+        cv2.putText(annotated_image, 'Nose', (nose_x-20, nose_y-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
         
-        for face_landmarks in results.multi_face_landmarks:
-            # Draw face mesh
-            if show_landmarks:
-                mp_drawing.draw_landmarks(
-                    image=annotated_image,
-                    landmark_list=face_landmarks,
-                    connections=mp_face_mesh.FACEMESH_TESSELATION,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style()
-                )
-            
-            if show_contours:
-                # Draw contours
-                mp_drawing.draw_landmarks(
-                    image=annotated_image,
-                    landmark_list=face_landmarks,
-                    connections=mp_face_mesh.FACEMESH_CONTOURS,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style()
-                )
-            
-            # Draw irises
-            mp_drawing.draw_landmarks(
-                image=annotated_image,
-                landmark_list=face_landmarks,
-                connections=mp_face_mesh.FACEMESH_IRISES,
-                landmark_drawing_spec=None,
-                connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_iris_connections_style()
-            )
-            
-            # Extract specific landmarks
-            h, w, _ = annotated_image.shape
-            landmarks = face_landmarks.landmark
-            
-            # Key facial features indices
-            LEFT_EYE = [33, 133, 160, 159, 158, 157, 173]
-            RIGHT_EYE = [362, 263, 387, 386, 385, 384, 398]
-            NOSE_TIP = [1, 2]
-            LIPS = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291]
-            LEFT_EAR = [234, 127, 162]  # Approximate ear region
-            RIGHT_EAR = [454, 356, 389]  # Approximate ear region
-            
-            # Draw labeled points
-            features = {
-                "Left Eye": LEFT_EYE,
-                "Right Eye": RIGHT_EYE,
-                "Nose": NOSE_TIP,
-                "Lips": LIPS,
-                "Left Ear Region": LEFT_EAR,
-                "Right Ear Region": RIGHT_EAR
-            }
-            
-            for feature_name, indices in features.items():
-                for idx in indices:
-                    x = int(landmarks[idx].x * w)
-                    y = int(landmarks[idx].y * h)
-                    
-                    # Draw feature points
-                    if "Eye" in feature_name:
-                        color = (0, 255, 0)  # Green for eyes
-                    elif "Nose" in feature_name:
-                        color = (255, 0, 0)  # Blue for nose
-                    elif "Lips" in feature_name:
-                        color = (0, 0, 255)  # Red for lips
-                    else:
-                        color = (255, 255, 0)  # Cyan for ears
-                    
-                    cv2.circle(annotated_image, (x, y), 3, color, -1)
+        # Draw approximate ear locations (sides of face)
+        # Left ear
+        left_ear_x = x - 10
+        left_ear_y = y + h//3
+        cv2.circle(annotated_image, (left_ear_x, left_ear_y), 8, (0, 255, 255), 2)
+        cv2.putText(annotated_image, 'Ear', (left_ear_x-30, left_ear_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         
-        # Convert back to RGB
-        annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
-        return annotated_image, f"Detected {len(results.multi_face_landmarks)} face(s)"
+        # Right ear
+        right_ear_x = x + w + 10
+        right_ear_y = y + h//3
+        cv2.circle(annotated_image, (right_ear_x, right_ear_y), 8, (0, 255, 255), 2)
+        cv2.putText(annotated_image, 'Ear', (right_ear_x+10, right_ear_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    
+    # Convert back to RGB
+    annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
+    
+    message = f"Detected {feature_count['faces']} face(s)"
+    if show_landmarks:
+        message += f", {feature_count['eyes']} eye(s), {feature_count['mouths']} mouth(s)"
+    
+    return annotated_image, message
 
 # Input method selection
 input_method = st.radio("Choose input method:", ["Upload Image", "Use Webcam"])
@@ -145,8 +125,8 @@ if input_method == "Upload Image":
         
         with col2:
             st.subheader("Detected Features")
-            with st.spinner("Detecting facial landmarks..."):
-                result_image, message = detect_face_landmarks(image)
+            with st.spinner("Detecting facial features..."):
+                result_image, message = detect_face_features(image)
                 
                 if result_image is not None:
                     st.success(message)
@@ -159,13 +139,13 @@ if input_method == "Upload Image":
         st.subheader("Feature Color Legend")
         legend_col1, legend_col2, legend_col3, legend_col4 = st.columns(4)
         with legend_col1:
-            st.markdown("🟢 **Green** - Eyes")
+            st.markdown("🟢 **Green** - Face Outline")
         with legend_col2:
-            st.markdown("🔵 **Blue** - Nose")
+            st.markdown("🔵 **Blue** - Eyes")
         with legend_col3:
-            st.markdown("🔴 **Red** - Lips")
+            st.markdown("🔴 **Red** - Mouth")
         with legend_col4:
-            st.markdown("🟡 **Yellow** - Ear Region")
+            st.markdown("🟡 **Yellow** - Nose & Ears")
 
 else:  # Webcam
     st.info("Click 'Start' to capture from webcam")
@@ -183,8 +163,8 @@ else:  # Webcam
         
         with col2:
             st.subheader("Detected Features")
-            with st.spinner("Detecting facial landmarks..."):
-                result_image, message = detect_face_landmarks(image)
+            with st.spinner("Detecting facial features..."):
+                result_image, message = detect_face_features(image)
                 
                 if result_image is not None:
                     st.success(message)
@@ -195,21 +175,24 @@ else:  # Webcam
 # Information section
 with st.expander("ℹ️ About This Application"):
     st.markdown("""
-    This application uses **MediaPipe Face Mesh** to detect 478 facial landmarks including:
+    This application uses **OpenCV Cascade Classifiers** to detect facial features including:
     
-    - **Eyes**: Detects eye contours and irises
-    - **Nose**: Identifies nose tip and bridge
-    - **Lips**: Outlines mouth and lip contours
-    - **Ears**: Approximates ear regions
-    - **Face Contours**: Maps entire facial structure
+    - **Face**: Detects face boundaries
+    - **Eyes**: Identifies eye locations
+    - **Nose**: Approximates nose position (center of face)
+    - **Mouth**: Detects mouth/smile region
+    - **Ears**: Approximates ear positions (sides of face)
     
     **How to use:**
     1. Upload an image or use your webcam
-    2. Adjust detection settings in the sidebar
-    3. View detected facial features with color-coded landmarks
+    2. Adjust detection settings in the sidebar for better accuracy
+    3. View detected facial features with color-coded markers
     
     **Technologies:**
     - Streamlit for web interface
-    - MediaPipe for face detection
-    - OpenCV for image processing
+    - OpenCV for face detection (Haar Cascades)
+    - Compatible with Python 3.13+
+    
+    **Note:** This version uses OpenCV's traditional cascade classifiers which work with any Python version.
+    For more accurate landmark detection (478 points), use the MediaPipe version with Python 3.8-3.11.
     """)
